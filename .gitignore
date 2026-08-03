@@ -1,0 +1,7 @@
+venv/
+.env
+data/
+__pycache__/
+cogs/__pycache__/
+audio/__pycache__/
+*.pyc
