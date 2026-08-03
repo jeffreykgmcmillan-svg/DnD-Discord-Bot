@@ -113,3 +113,6 @@ local Whisper "small" model comfortably.
 - Auto-growing NPC/location glossary/wiki extracted from recaps over time
 - Export recap to PDF/Notion/Google Docs
 - Per-player DM delivery of secret/private information revealed mid-session
+
+# DnD-Discord-Bot
+Homebrew discord companion bot for homebrew D&amp;D sessions
