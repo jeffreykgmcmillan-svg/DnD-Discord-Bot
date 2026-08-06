@@ -1,8 +1,12 @@
+import logging
+
 import discord
 from discord.ext import commands
 from discord import Option
 
 import database as db
+
+logger = logging.getLogger("notes")
 
 
 class NotesCog(commands.Cog):
@@ -17,6 +21,7 @@ class NotesCog(commands.Cog):
         ctx: discord.ApplicationContext,
         count: Option(int, "How many sessions back", default=3),
     ):
+        logger.info(f"/notes recent invoked by {ctx.author.display_name} (count={count})")
         sessions = await db.get_recent_sessions(ctx.guild.id, limit=count)
         if not sessions:
             await ctx.respond("No past sessions logged yet.")
@@ -33,6 +38,7 @@ class NotesCog(commands.Cog):
         ctx: discord.ApplicationContext,
         term: Option(str, "Keyword to search for"),
     ):
+        logger.info(f"/notes search invoked by {ctx.author.display_name}: term='{term}'")
         results = await db.search_sessions(ctx.guild.id, term)
         if not results:
             await ctx.respond(f"No past sessions mention '{term}'.")

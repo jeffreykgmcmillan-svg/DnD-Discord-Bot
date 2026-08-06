@@ -10,4 +10,10 @@ DATA_DIR = os.getenv("DATA_DIR", "./data")
 DB_PATH = os.path.join(DATA_DIR, "campaign.db")
 RECORDINGS_DIR = os.path.join(DATA_DIR, "recordings")
 
+# Optional: your server's ID, so slash commands sync instantly to it instead
+# of relying on Discord's global command sync (which can take up to an hour
+# to propagate new/changed commands). Leave unset to sync globally instead.
+_guild_id = os.getenv("DISCORD_GUILD_ID")
+GUILD_IDS = [int(_guild_id)] if _guild_id else None
+
 os.makedirs(RECORDINGS_DIR, exist_ok=True)

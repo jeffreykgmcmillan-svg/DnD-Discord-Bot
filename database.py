@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS characters (
     user_id INTEGER NOT NULL,
     discord_name TEXT NOT NULL,
     character_name TEXT NOT NULL,
+    is_dm INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (guild_id, user_id)
 );
 
@@ -31,6 +32,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # Safe migration for databases created before is_dm existed.
+        try:
+            await db.execute("ALTER TABLE characters ADD COLUMN is_dm INTEGER NOT NULL DEFAULT 0")
+            await db.commit()
+        except aiosqlite.OperationalError:
+            pass  # column already exists
         await db.commit()
 
 
@@ -43,6 +50,24 @@ async def link_character(guild_id: int, user_id: int, discord_name: str, charact
                  discord_name=excluded.discord_name,
                  character_name=excluded.character_name""",
             (guild_id, user_id, discord_name, character_name),
+        )
+        await db.commit()
+
+
+async def set_dm(guild_id: int, user_id: int, discord_name: str, title: str = "Dungeon Master"):
+    """Marks a user as the DM, clearing DM status from anyone else in this guild."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE characters SET is_dm = 0 WHERE guild_id = ?", (guild_id,)
+        )
+        await db.execute(
+            """INSERT INTO characters (guild_id, user_id, discord_name, character_name, is_dm)
+               VALUES (?, ?, ?, ?, 1)
+               ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                 discord_name=excluded.discord_name,
+                 character_name=excluded.character_name,
+                 is_dm=1""",
+            (guild_id, user_id, discord_name, title),
         )
         await db.commit()
 
@@ -65,6 +90,19 @@ async def get_character_name(guild_id: int, user_id: int) -> str | None:
         )
         row = await cursor.fetchone()
         return row[0] if row else None
+
+
+async def get_character_info(guild_id: int, user_id: int) -> dict | None:
+    """Returns {'character_name': str, 'is_dm': bool} or None if not linked."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT character_name, is_dm FROM characters WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return {"character_name": row[0], "is_dm": bool(row[1])}
 
 
 async def set_summary_channel(guild_id: int, channel_id: int):

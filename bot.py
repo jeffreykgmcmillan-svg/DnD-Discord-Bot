@@ -1,15 +1,22 @@
+import logging
 import discord
 from discord.ext import commands
 
 import config
 import database as db
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 intents.voice_states = True
 
-bot = discord.Bot(intents=intents)
+bot = discord.Bot(intents=intents, debug_guilds=config.GUILD_IDS)
 
 COGS = ["cogs.session", "cogs.characters", "cogs.notes"]
 
