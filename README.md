@@ -132,7 +132,7 @@ Every command and major operational step (voice connect, per-speaker
 transcription, Claude summarization, disconnect) logs to stdout with a
 timestamp and module tag, e.g.:
 ```
-00:14:35 [session] /session end invoked by shardik in guild 409798614001647616
+00:14:35 [session] /session end invoked by shardik in guild 40*****
 00:14:35 [session] Transcribing audio for Barnaby Thundermuzzle (shardik)...
 00:15:06 [session] Summary received (447 chars)
 ```
