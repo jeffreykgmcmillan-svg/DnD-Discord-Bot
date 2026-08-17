@@ -1,9 +1,9 @@
 """
 Recording model: a "session" can be made of multiple "takes" (start -> pause,
-resume -> pause, ..., -> end). Each take is recorded to its own set of per-user
-WAV files via py-cord's sink API, transcribed independently, then all takes'
-transcript lines are merged in chronological order (with a running time offset)
-when the session ends.
+resume -> pause, ..., -> end, or an unexpected disconnect -> auto-reconnect).
+Each take is recorded to its own set of per-user WAV files via py-cord's sink
+API, transcribed independently, then all takes' transcript lines are merged
+in chronological order (with a running time offset) when the session ends.
 """
 import asyncio
 import datetime
@@ -21,17 +21,23 @@ from summarizer import summarize_session
 
 logger = logging.getLogger("session")
 
+TRANSCRIPTION_TIMEOUT_SECONDS = 90 * 60
+MAX_AUTO_RECONNECT_ATTEMPTS = 3
+
 
 class GuildSessionState:
     def __init__(self, session_id: int, voice_client: discord.VoiceClient):
         self.session_id = session_id
         self.voice_client = voice_client
+        self.channel_id = voice_client.channel.id
         self.take_index = 0
-        self.elapsed_before_current_take = 0.0  # seconds, from prior takes
+        self.elapsed_before_current_take = 0.0
         self.take_started_at: datetime.datetime | None = None
         self.all_lines: list[TranscriptLine] = []
         self.take_finished_event = asyncio.Event()
         self.session_start = datetime.datetime.utcnow()
+        self.intentional_disconnect = False
+        self.reconnect_attempts = 0
 
 
 class SessionCog(commands.Cog):
@@ -46,11 +52,11 @@ class SessionCog(commands.Cog):
         os.makedirs(path, exist_ok=True)
         return path
 
-    async def _start_take(self, ctx: discord.ApplicationContext, state: GuildSessionState):
+    async def _start_take(self, guild_id: int, state: GuildSessionState):
         sink = discord.sinks.WaveSink()
         state.take_finished_event.clear()
         state.take_started_at = datetime.datetime.utcnow()
-        state.voice_client.start_recording(sink, self._on_take_finished, ctx.guild.id, state)
+        state.voice_client.start_recording(sink, self._on_take_finished, guild_id, state)
 
     async def _on_take_finished(self, sink: discord.sinks.WaveSink, guild_id: int, state: GuildSessionState):
         take_dir = self._take_dir(guild_id, state.session_id, state.take_index)
@@ -82,24 +88,142 @@ class SessionCog(commands.Cog):
                 line.start += state.elapsed_before_current_take
                 state.all_lines.append(line)
 
-            # The raw audio is only needed long enough to transcribe it --
-            # keeping it afterward would let disk usage grow unbounded across
-            # sessions for no benefit, since the text transcript is what
-            # actually gets used/kept.
             try:
                 os.remove(wav_path)
             except OSError:
-                pass  # non-fatal -- worst case a leftover file, not a crash
+                pass
 
         state.elapsed_before_current_take += take_duration
         state.take_index += 1
         state.take_finished_event.set()
+        logger.info(f"take_finished_event set for guild {guild_id}, take {state.take_index - 1}")
 
-        # Clean up the now-empty take directory too.
         try:
             shutil.rmtree(take_dir, ignore_errors=True)
         except OSError:
             pass
+
+    async def _stop_recording_and_wait(self, state: GuildSessionState) -> bool:
+        try:
+            state.voice_client.stop_recording()
+        except Exception as e:
+            logger.warning(f"stop_recording() raised (may already be stopped): {e!r}")
+
+        try:
+            await asyncio.wait_for(
+                state.take_finished_event.wait(), timeout=TRANSCRIPTION_TIMEOUT_SECONDS
+            )
+            logger.info("Take finished transcribing")
+            return True
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Timed out after {TRANSCRIPTION_TIMEOUT_SECONDS}s waiting for take to finish "
+                f"transcribing (session {state.session_id}) -- treating as stuck"
+            )
+            return False
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+    ):
+        if member.id != self.bot.user.id:
+            return
+        if before.channel is None or after.channel is not None:
+            return
+
+        guild_id = before.channel.guild.id
+        state = self.states.get(guild_id)
+        if not state:
+            return
+
+        if state.intentional_disconnect:
+            logger.info(f"Voice state update: intentional disconnect for guild {guild_id}, ignoring")
+            return
+
+        logger.warning(
+            f"Unexpected voice disconnect detected for guild {guild_id} "
+            f"(session {state.session_id}) -- attempting automatic recovery"
+        )
+        await self._handle_unexpected_disconnect(guild_id, before.channel, state)
+
+    async def _handle_unexpected_disconnect(
+        self, guild_id: int, channel: discord.VoiceChannel, state: GuildSessionState
+    ):
+        state.reconnect_attempts += 1
+        if state.reconnect_attempts > MAX_AUTO_RECONNECT_ATTEMPTS:
+            logger.error(
+                f"Guild {guild_id}: exceeded {MAX_AUTO_RECONNECT_ATTEMPTS} automatic reconnect "
+                f"attempts for session {state.session_id} -- giving up, needs manual attention"
+            )
+            await self._notify_recap_channel(
+                guild_id,
+                "⚠️ Lost the voice connection multiple times in a row and couldn't stay connected. "
+                "I've stopped trying to auto-reconnect. Whatever was captured so far is safely "
+                "preserved -- run `/session end` to wrap it up with what's recorded, or `/session "
+                "force-leave` first if needed, then investigate before starting again.",
+            )
+            return
+
+        logger.info(f"Finalizing dropped take for guild {guild_id} before reconnecting...")
+        finished = await self._stop_recording_and_wait(state)
+        if not finished:
+            logger.error(
+                f"Guild {guild_id}: timed out finalizing the dropped take -- attempting to "
+                f"reconnect anyway, but this take's data may be incomplete"
+            )
+
+        try:
+            vc = await channel.connect()
+        except Exception as e:
+            logger.error(f"Guild {guild_id}: failed to reconnect to voice: {e!r}")
+            await self._notify_recap_channel(
+                guild_id,
+                f"⚠️ Lost the voice connection and the automatic attempt to rejoin **{channel.name}** "
+                f"failed. Whatever was captured so far is safely preserved -- try `/session start` "
+                f"again, or `/session end` to wrap up with what's recorded.",
+            )
+            return
+
+        for _ in range(60):
+            if vc.is_connected():
+                break
+            await asyncio.sleep(0.5)
+        else:
+            logger.error(f"Guild {guild_id}: reconnect attempt did not become ready after 30s")
+            await self._notify_recap_channel(
+                guild_id,
+                f"⚠️ Lost the voice connection and couldn't fully re-establish audio after rejoining "
+                f"**{channel.name}**. Whatever was captured so far is safely preserved -- try `/session "
+                f"start` again, or `/session end` to wrap up with what's recorded.",
+            )
+            return
+
+        state.voice_client = vc
+        state.channel_id = channel.id
+        await self._start_take(guild_id, state)
+        logger.info(
+            f"Guild {guild_id}: reconnected to '{channel.name}' and resumed recording "
+            f"(take {state.take_index}, attempt {state.reconnect_attempts}/{MAX_AUTO_RECONNECT_ATTEMPTS})"
+        )
+        await self._notify_recap_channel(
+            guild_id,
+            f"🔄 Lost the voice connection for a moment but reconnected automatically and resumed "
+            f"recording in **{channel.name}**. Nothing captured before the drop was lost.",
+        )
+
+    async def _notify_recap_channel(self, guild_id: int, message: str):
+        summary_channel_id = await db.get_summary_channel(guild_id)
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        channel = guild.get_channel(summary_channel_id) if summary_channel_id else None
+        if channel:
+            try:
+                await channel.send(message)
+            except Exception as e:
+                logger.warning(f"Failed to post reconnect notification: {e!r}")
+        else:
+            logger.info(f"(No summary channel configured to notify for guild {guild_id}: {message})")
 
     @session.command(name="start", description="Join your voice channel and start taking notes")
     async def start(self, ctx: discord.ApplicationContext):
@@ -126,18 +250,12 @@ class SessionCog(commands.Cog):
         logger.info(f"Connected to voice channel '{voice_channel.name}', waiting for audio link to be ready...")
 
         if isinstance(voice_channel, discord.StageChannel):
-            # Bots often join Stage Channels as suppressed "audience" members
-            # by default, which would prevent audio from flowing at all.
             try:
                 await ctx.guild.me.edit(suppress=False)
                 logger.info("Un-suppressed self in Stage Channel")
             except discord.HTTPException:
-                pass  # Non-fatal -- worst case the connection check below will catch it
+                pass
 
-        # The text-level connection can report success slightly before the
-        # underlying voice/UDP link is actually ready to record. Give it a
-        # generous window, and fail with a clear message (rather than a
-        # confusing crash) if it never comes up.
         for _ in range(60):
             if vc.is_connected():
                 break
@@ -158,7 +276,7 @@ class SessionCog(commands.Cog):
         state = GuildSessionState(session_id, vc)
         self.states[ctx.guild.id] = state
 
-        await self._start_take(ctx, state)
+        await self._start_take(ctx.guild.id, state)
         logger.info(f"Session {session_id} started, recording (take 0)")
 
         await ctx.respond(
@@ -176,8 +294,17 @@ class SessionCog(commands.Cog):
             await ctx.respond("There's no active session in this server.")
             return
         await ctx.defer()
-        state.voice_client.stop_recording()
-        await state.take_finished_event.wait()
+
+        finished = await self._stop_recording_and_wait(state)
+        if not finished:
+            await ctx.respond(
+                "⚠️ Pausing is taking unusually long -- transcription seems stuck rather than just "
+                "slow. Recording has been stopped, but I can't confirm the transcript is complete. "
+                "**Please don't restart the bot yet** -- completed data may still be recoverable from "
+                "memory. Check the logs, or reach out for help troubleshooting this before continuing."
+            )
+            return
+
         await db.update_session_status(state.session_id, "paused")
         logger.info(f"Session {state.session_id} paused")
         await ctx.respond("⏸️ Recording paused. Use `/session resume` when you're back.")
@@ -191,7 +318,7 @@ class SessionCog(commands.Cog):
             await ctx.respond("There's no paused session in this server. Use `/session start` instead.")
             return
         await ctx.defer()
-        await self._start_take(ctx, state)
+        await self._start_take(ctx.guild.id, state)
         await db.update_session_status(state.session_id, "active")
         logger.info(f"Session {state.session_id} resumed (take {state.take_index})")
         await ctx.respond("▶️ Recording resumed.")
@@ -207,13 +334,20 @@ class SessionCog(commands.Cog):
 
         await ctx.respond("🧠 Wrapping up... transcribing and writing the recap. This can take a few minutes.")
 
-        current_status = (await db.get_active_session(ctx.guild.id) or {}).get("status")
-        if current_status == "active":
-            logger.info("Stopping active recording...")
-            state.voice_client.stop_recording()
-            await state.take_finished_event.wait()
-            logger.info("Recording stopped, final take transcribed")
+        logger.info("Stopping recording (if any) and waiting for final transcription...")
+        finished = await self._stop_recording_and_wait(state)
+        if not finished:
+            await ctx.followup.send(
+                "⚠️ This session seems stuck finishing up -- transcription has been running far "
+                "longer than expected and I can't confirm it's complete. **Please don't restart the "
+                "bot yet** -- any completed transcription is likely still safely sitting in memory "
+                "and recoverable. This needs a human to check the logs before deciding next steps "
+                "(running `/session end` again shortly may simply work, once whatever's stuck clears)."
+            )
+            return
+        logger.info("Recording stopped, final take transcribed")
 
+        state.intentional_disconnect = True
         logger.info("Disconnecting from voice...")
         await self._fully_disconnect(ctx.guild)
         logger.info("Disconnect step complete")
@@ -261,7 +395,6 @@ class SessionCog(commands.Cog):
         for chunk in chunks:
             await target_channel.send(chunk)
 
-        # Attach full transcript for the record
         await target_channel.send(file=discord.File(transcript_path, filename=f"session_{state.session_id}_transcript.txt"))
         logger.info(f"Recap posted to #{target_channel.name}, session {state.session_id} complete")
 
@@ -269,14 +402,6 @@ class SessionCog(commands.Cog):
         await ctx.followup.send(f"✅ Recap posted in {target_channel.mention}.")
 
     async def _fully_disconnect(self, guild: discord.Guild):
-        """
-        Disconnects from voice as reliably as possible. This dev build of
-        py-cord's higher-level VoiceClient teardown can hang (still-maturing
-        DAVE/E2EE support) -- so instead we primarily rely on directly telling
-        Discord's gateway "I've left voice" over the bot's main connection
-        (which stays healthy even when the voice-specific handshake doesn't),
-        then also attempt the higher-level cleanup for good measure.
-        """
         try:
             await guild.change_voice_state(channel=None)
             logger.info("change_voice_state(None) succeeded")
@@ -304,6 +429,9 @@ class SessionCog(commands.Cog):
     async def force_leave(self, ctx: discord.ApplicationContext):
         logger.info(f"/session force-leave invoked by {ctx.author.display_name} in guild {ctx.guild.id}")
         await ctx.defer()
+        state = self.states.get(ctx.guild.id)
+        if state:
+            state.intentional_disconnect = True
         await self._fully_disconnect(ctx.guild)
         if ctx.guild.id in self.states:
             del self.states[ctx.guild.id]
