@@ -1,235 +1,205 @@
 # CLAUDE.md
 
-Context for any AI assistant (or human) working on this repository. Read
-this before making changes — several things here aren't discoverable from
-the code alone, and getting them wrong has cost real debugging time before.
+Context file for any AI assistant working in this repository. Read this
+before proposing or making changes. When suggesting code changes, explicitly
+confirm the changes adhere to the AI COMPLETION CHECKLIST at the bottom
+before presenting them.
 
-## What this is
+## PROJECT OVERVIEW
 
 A Discord bot that joins a D&D group's voice channel, records each speaker
 separately, transcribes locally with Whisper, and posts an AI-written recap
-to a text channel. Runs 24/7 on a free-tier Oracle Cloud server for one
-specific Discord server (a friend group), not a general-purpose public bot.
+to a text channel. Single private Discord server (one friend group), not a
+public/multi-tenant bot. Runs 24/7 on a free-tier Oracle Cloud instance
+constrained to **1 OCPU / 6GB RAM** — this sizing is deliberate (see
+ANTI-PATTERNS) and should not be casually treated as a bottleneck to "fix"
+by recommending more compute without flagging the real cost tradeoff.
 
-## Tech stack
+## TECH STACK & DEPENDENCIES
 
-- Python 3.10+, `py-cord` (Discord library), `faster-whisper` (local
-  transcription), Anthropic API (Claude, for recap summarization), SQLite
-  via `aiosqlite`
-- Hosted on Oracle Cloud "Always Free" tier: Ubuntu 22.04, ARM (Ampere),
-  **1 OCPU / 6GB RAM** — deliberately sized this small to stay permanently
-  free (see incident log below — it was accidentally provisioned 4x too
-  large at one point). Do not casually recommend resizing up without
-  flagging the cost tradeoff explicitly to the user first.
-- Runs as a `systemd` service (`dnd-bot.service`), not a manually-run
-  process.
+- Python 3.10+
+- `py-cord` — Discord library
+- `faster-whisper` — local speech-to-text
+- Anthropic API (Claude) — recap summarization
+- SQLite via `aiosqlite`
+- Host: Oracle Cloud "Always Free," Ubuntu 22.04, ARM (Ampere)
+- Process manager: `systemd` (`dnd-bot.service`)
 
-## Critical: the py-cord dependency is NOT the official release
+**CRITICAL — py-cord version constraint:** `requirements.txt` pins py-cord
+to an **unreleased development branch** (`fix/voice-rec-2`), not a normal
+PyPI release. Do not "resolve" this to a standard version pin. Discord's
+DAVE (mandatory end-to-end voice encryption, since March 2026) broke voice
+*receiving* in the official py-cord release; sending/playing audio is
+unaffected, but this bot only records/receives. Before changing this pin,
+verify https://github.com/Pycord-Development/pycord/issues/3139 is closed
+with a real release that includes the fix — do not assume it's resolved.
 
-`requirements.txt` pins py-cord to a specific **unreleased development
-branch** (`fix/voice-rec-2`), not a normal PyPI version. This is
-intentional and required. Discord made end-to-end voice encryption (DAVE)
-mandatory in March 2026, and the official py-cord release still doesn't
-fully support *recording* audio under it (sending/playing audio works fine
-in the official release — receiving/recording doesn't). Do not "fix" an
-install by changing this to a plain version pin — that will silently break
-voice recording again. Before assuming this is still necessary, check
-https://github.com/Pycord-Development/pycord/issues/3139 for whether it's
-been resolved upstream and a real release now includes the fix.
+## ARCHITECTURE & FILE MAP
 
-Because of this, expect rough edges in voice connection teardown and
-occasional library immaturity — see the incident log below for specifics
-already worked around.
-
-## Architecture at a glance
-
-- `bot.py` — entry point, loads cogs, configures logging (Python's
-  `logging` module, set up once here; every other file just does
-  `logging.getLogger("name")` and inherits the format)
-- `config.py` — all environment variable reading lives here; nowhere else
-  should call `os.environ` directly
-- `database.py` — all SQL lives here; other files call plain async
-  functions, never write raw SQL themselves. SQLite via `aiosqlite`.
-- `audio/transcriber.py` — wraps faster-whisper (lazy-loads the model once)
-- `summarizer.py` — wraps the Anthropic API call, contains the recap system
+- `bot.py` — entry point; loads cogs; configures `logging` once (all other
+  files call `logging.getLogger("name")` and inherit this config)
+- `config.py` — sole owner of environment variable reads; no other file
+  should call `os.environ`/`os.getenv` directly
+- `database.py` — sole owner of SQL; other files call plain async functions
+  only
+- `audio/transcriber.py` — wraps faster-whisper, lazy-loads the model once
+- `summarizer.py` — wraps the Anthropic API call; contains the recap system
   prompt
-- `cogs/session.py` — the most complex file: voice connection lifecycle,
-  recording, the "take" system (a session = one or more takes, split by
-  pause/resume or an unexpected disconnect), auto-reconnect logic. Read
-  this file's docstring and the incident log below before touching it.
+- `cogs/session.py` — voice connection lifecycle, recording, the "take"
+  system (one session = 1+ takes, split by pause/resume/unexpected
+  disconnect), auto-reconnect logic. Highest-risk file for regressions —
+  see STRICT RULES below before editing.
 - `cogs/characters.py` — player/character/DM linking commands
 - `cogs/notes.py` — browsing/searching past recaps
 
-## Hard-won lessons (don't relearn these the expensive way)
+## COMMAND INTERFACE
 
-1. **Never call a blocking synchronous function directly inside `async`
-   code.** `faster-whisper` transcription and the Anthropic API call are
-   both synchronous; calling them directly froze the entire bot's event
-   loop (including the heartbeat that keeps Discord's connection alive) for
-   as long as they ran, which caused real, hard-to-diagnose disconnect
-   bugs (see incident log). Both are wrapped in
-   `loop.run_in_executor(None, fn, args)` in `cogs/session.py` — keep doing
-   this for any future slow/blocking call.
-2. **This server has exactly 1 CPU core.** Transcription runs sequentially,
-   one speaker at a time. A real session with 5 speakers can take 40+
-   minutes just to transcribe after `/session end`. This is a known,
-   accepted tradeoff for staying in the free tier, not a bug — but keep it
-   in mind before adding anything else CPU-heavy, and don't set aggressive
-   timeouts around transcription (see `TRANSCRIPTION_TIMEOUT_SECONDS`).
-3. **A plausible-sounding external explanation isn't automatically
-   correct.** "Discord's servers must just be flaky" was the wrong
-   conclusion at least twice during this project's history before the real,
-   in-our-control cause was found each time (see incident log). Prefer
-   reproducing and isolating over accepting the first explanation that fits.
-4. **Log liberally.** Every command and every major step in
-   `cogs/session.py` logs on entry/completion. This directly enabled
-   diagnosing several real bugs after the fact from `journalctl` output
-   alone, including recovering ~44 minutes of already-transcribed session
-   data from a stuck process without losing it. Keep this pattern for any
-   new command or long-running operation.
-5. **Voice connections can drop unexpectedly, unrelated to anything in this
-   codebase** — a known py-cord/Discord issue where "listen-only" bots
-   (never transmitting their own audio) occasionally get silently
-   disconnected after tens of minutes. The `on_voice_state_update` listener
-   in `cogs/session.py` auto-detects this and reconnects + resumes
-   recording as a new take, capped at 3 attempts per session (see
-   `MAX_AUTO_RECONNECT_ATTEMPTS`). Don't remove this without a replacement
-   safety net.
-6. **`/session end` and `/session pause` must be idempotent/re-runnable.**
-   Both call `_stop_recording_and_wait()`, which tolerates being called
-   when recording's already stopped (via try/except around
-   `stop_recording()`) rather than crashing. This matters because manual
-   recovery from a stuck session sometimes means re-running these commands.
+All user interactions are Discord **Slash Commands** (py-cord
+`SlashCommandGroup` / `@command`). Do not write legacy prefix-based
+(`!command`) commands — none exist in this codebase and none should be
+added.
 
-## Incident log (condensed history — real bugs found and fixed)
+## ENVIRONMENT VARIABLES & SECRETS
 
-**Getting voice recording working at all.** The core blocker for most of
-early development: Discord's DAVE encryption rollout broke voice *receiving*
-in every mainstream library. Router/firewall troubleshooting (both on a
-home network and on this Oracle server) was a red herring — the connection
-attempt reaching Discord's servers looked identical whether or not it would
-ever succeed, because the real failure was a protocol-level handshake gap
-in the library, not blocked traffic. Confirmed via a matching, already-known
-GitHub issue and fixed by pinning to the in-progress fix branch (see above).
+- Real secrets live in a `.env` file on the **server only**
+  (`/home/ubuntu/dnd-notetaker/.env`) — never committed to git
+  (`.gitignore`'d).
+- `.env.example` (committed, no real values) documents every variable with
+  a placeholder.
+- To add a new secret/config value:
+  1. Add it to `.env.example` with a placeholder value and a comment
+  2. Read it in `config.py` (via `os.environ[...]` if required, or
+     `os.getenv(..., default)` if optional — see existing pattern)
+  3. Manually add the real value to the actual `.env` file on the server
+     over SSH (e.g. `nano .env`) — this step is not automated
+  4. Restart the `dnd-bot` service to pick up the change
 
-**Stuck-in-voice-channel bug, and the wrong initial theory.** After
-`/session end` completed and posted a recap, the bot would sometimes stay
-in the voice channel for minutes, or indefinitely. First theory (accepted
-too quickly): "Discord's servers are just slow to tear down DAVE-encrypted
-sessions." Real cause, found only after being pushed to look harder:
-`faster-whisper` and the Anthropic API call were both blocking the entire
-asyncio event loop (see lesson #1 above), starving the Discord gateway
-heartbeat and causing it to silently need to recover. Fixed via
-`run_in_executor`. Confirmed fixed by the same operation completing in
-~30 seconds afterward, logged end-to-end.
+## STRICT RULES & KNOWN QUIRKS
 
-**Storage risk.** Raw per-speaker WAV recordings were never deleted after
-transcription, which would have grown disk usage unboundedly across
-sessions (several GB per real session). Fixed: `_on_take_finished` now
-deletes each WAV file immediately after transcribing it, and cleans up the
-empty take directory.
+**Rule 1 — Never block the asyncio event loop.**
+Context: `faster-whisper` transcription and the Anthropic API call are both
+synchronous. Calling either directly inside `async` code freezes the entire
+event loop — including the Discord gateway heartbeat — for as long as the
+call takes, which previously caused the bot to silently disconnect/hang
+after `/session end`.
+Enforcement: Always wrap blocking calls as
+`await loop.run_in_executor(None, fn, *args)`. Applies to any future
+CPU-bound or blocking-I/O call, not just the two current ones.
 
-**Oracle instance accidentally 4x oversized.** At one point the running
-instance was actually provisioned at 4 OCPU / 24GB rather than the intended
-1 OCPU / 6GB — a real risk of exceeding the free monthly allowance if left
-running 24/7 (confirmed via the math: 1,500 free OCPU-hours/month vs. ~2,920
-that a 4-OCPU instance running continuously would use). Caught during a
-deliberate cost review and resized down before it became a real charge.
-Always double-check actual provisioned size on the instance's plain detail
-page, not the shape-selection wizard's slider range.
+**Rule 2 — Auto-reconnect must stay in place; do not remove without a
+replacement.**
+Context: Discord/py-cord has a known issue (pre-dates DAVE) where
+listen-only voice bots (never transmit their own audio) get silently
+disconnected after extended periods, with a clean-looking close code that
+implies no error. This is an upstream issue, not fixable in this codebase.
+Enforcement: `on_voice_state_update` in `cogs/session.py` detects
+unexpected drops (`state.intentional_disconnect` is `False`) and
+auto-rejoins + resumes recording as a new take, capped at
+`MAX_AUTO_RECONNECT_ATTEMPTS = 3`. Any intentional disconnect path (new or
+existing) must set `state.intentional_disconnect = True` first, or the
+watchdog will misfire.
 
-**`/session end` non-idempotent + a genuinely stuck session.** During a
-real ~1-hour test with 5 speakers, the bot unexpectedly left voice mid-session
-(see next item for why) and the subsequent processing got stuck for 19+
-hours with zero errors logged — transcription for all 5 speakers had
-actually completed successfully, but the code never proceeded past that
-point to build/post the recap, for reasons never fully confirmed. A second
-`/session end` attempt crashed (`RecordingException: You are not
-recording`) instead of helping. Recovered by manually flipping the
-session's DB status flag (`UPDATE sessions SET status='paused'`) to route
-around the crashing code path, which let `/session end` pick up the
-already-completed in-memory transcription and post the recap successfully
-— confirming the data survives in memory even when a session appears
-stuck, as long as the bot process itself isn't restarted. This led directly
-to lesson #6 above and the `TRANSCRIPTION_TIMEOUT_SECONDS` (90 min) bound,
-so a future stuck session surfaces a clear error instead of hanging
-silently for hours.
+**Rule 3 — `/session end` and `/session pause` must remain idempotent.**
+Context: A second invocation (e.g. retrying after a network hiccup, or
+manual recovery from a stuck session) previously crashed with
+`RecordingException: You are not recording`.
+Enforcement: Both route through `_stop_recording_and_wait()`, which wraps
+`stop_recording()` in try/except and tolerates "already stopped." Any new
+command that stops/starts recording must use this same helper, not call
+`stop_recording()`/`start_recording()` directly.
 
-**Root cause of that mid-session disconnect: a known upstream bug.**
-Investigation found a pre-existing, previously-reported py-cord issue
-(predating DAVE entirely) affecting listen-only voice bots (bots that
-receive audio but never transmit their own) — they can get silently
-disconnected by Discord after an extended period, with a clean-looking
-close code that doesn't indicate an actual error. This is not something
-fixable from this codebase's side. Mitigated (not "fixed," since the root
-cause is upstream) via the auto-reconnect logic in lesson #5 above, which
-detects the drop via `on_voice_state_update` and transparently rejoins +
-resumes as a new take.
+**Rule 4 — Transcription is slow; do not assume anything is "stuck" below
+90 minutes.**
+Context: This server has exactly 1 CPU core. Transcription runs
+sequentially, one speaker at a time. A real 5-speaker session has taken 40+
+minutes. `TRANSCRIPTION_TIMEOUT_SECONDS = 90 * 60` reflects this — do not
+lower it without understanding this constraint, and do not add other
+timeouts around transcription shorter than this.
 
-## Deployment workflow (this matters — it's not `git push`)
+**Rule 5 — Delete raw audio immediately after transcribing it.**
+Context: Un-deleted per-speaker WAV files would grow disk usage unboundedly
+across sessions (several GB/session at scale).
+Enforcement: `_on_take_finished` in `cogs/session.py` deletes each WAV file
+right after transcribing it, and removes the resulting empty take
+directory. Any new code path that writes audio to disk must clean up the
+same way.
 
-The production server does **not** pull from GitHub directly. Changes are
-deployed by:
-1. Editing files
-2. `python3 -m py_compile <file>` to catch syntax errors before deploying
-   anything
-3. Getting the file(s) onto the server — either a full project zip via
-   `scp`, or for single-file changes, a `cat > file << 'EOF' ... EOF`
-   heredoc pasted directly into the SSH session (this avoids `nano`
-   whitespace/tab corruption issues that have bitten this project before —
-   avoid recommending manual `nano` edits for anything beyond a one-line
-   change)
-4. `sudo systemctl stop dnd-bot` before overwriting files, then
-   `sudo systemctl daemon-reload && sudo systemctl restart dnd-bot`
-5. Verify with `sudo journalctl -u dnd-bot -f`
+**Rule 6 — Database schema changes must not break existing production
+data.**
+Context: The bot has real, irreplaceable session history in its SQLite DB.
+Enforcement: New columns must be added via `ALTER TABLE` wrapped in
+`try/except aiosqlite.OperationalError: pass` (see `init_db()` in
+`database.py`), so re-running startup on an existing DB doesn't fail.
 
-GitHub is used purely as a showcase/backup of the code, updated
-periodically, not as the deployment mechanism.
+**Rule 7 — If a session appears stuck, do not restart the bot process as a
+first response.**
+Context: A stuck-but-not-crashed session may have already-completed,
+in-memory transcription data (proven recoverable in a real incident by
+manually flipping the session's DB status to bypass a crashing code path
+and re-running `/session end`). Restarting the process destroys anything
+not yet written to disk.
+Enforcement: Investigate via `journalctl` and the database first. Only
+restart once data has been confirmed either saved or unrecoverable.
 
-## Before considering any change "done"
+## DEPLOYMENT INSTRUCTIONS
 
-- [ ] `python3 -m py_compile` on every changed file
-- [ ] If it touches `cogs/session.py`, consider whether it affects: the
-      idempotency of `/session end` / `/session pause`, the auto-reconnect
-      logic, or the event-loop-blocking rule (lesson #1)
-- [ ] If it touches the database schema, use an `ALTER TABLE` guarded by
-      `try/except aiosqlite.OperationalError` (see `init_db()`) so existing
-      production data isn't broken — this bot has real, irreplaceable
-      session history in it
-- [ ] Consider whether a real, in-progress session could be active on the
-      production server when this gets deployed — a restart mid-session
-      currently loses any not-yet-finalized take's audio
+Production does **not** pull from GitHub. GitHub is a backup/showcase,
+updated periodically, not the deployment mechanism. Actual deploy flow:
 
-## Cost model (for context, not a live dashboard — verify current numbers if it matters)
+1. `python3 -m py_compile <file>` on every changed file first
+2. Transfer to server: full-project `scp` for multi-file changes, or a
+   `cat > file << 'EOF' ... EOF` heredoc pasted directly into the SSH
+   session for single-file changes (avoid recommending manual `nano` edits
+   beyond trivial one-line changes — has caused whitespace/tab corruption
+   before)
+3. `sudo systemctl stop dnd-bot` before overwriting files
+4. `sudo systemctl daemon-reload && sudo systemctl restart dnd-bot`
+5. Verify via `sudo journalctl -u dnd-bot -f`
+6. Push the same change to GitHub — do not skip this; repo/production
+   drift has happened before
 
-- Oracle compute: fixed-size, always-on, flat allowance-based — not
-  metered per-request, so command volume/abuse can't directly increase this
-  bill. Only real risk is provisioning too large a shape (see incident log).
-- Anthropic API: pay-as-you-go, no auto-reload enabled on the account, so
-  it fails gracefully rather than overspending. Roughly $0.10-$0.30 per
-  real 3-hour session's summarization call.
-- Rate limiting / queueing infrastructure was deliberately not built —
-  traffic is a handful of trusted users in one private server, already
-  naturally throttled by "only one session active at a time" plus
-  transcription being the real bottleneck. Revisit if/when an
-  image-generation feature ships, since per-call cost is higher for images.
+## ANTI-PATTERNS (DO NOT IMPLEMENT WITHOUT EXPLICIT DISCUSSION)
 
-## Things this project deliberately does NOT have (don't add without discussion)
+- **No rate-limiting/queueing infrastructure.** Single private server,
+  trusted users, already naturally throttled (one session active at a
+  time; transcription itself is the bottleneck). Do not add Redis, job
+  queues, or per-user cooldown systems speculatively.
+- **No multi-guild/multi-tenant support.** SQLite schema and session state
+  (`self.states: dict[guild_id, ...]`) assume one Discord server.
+- **No CI/CD pipeline.** Deployment is intentionally manual/SSH-based at
+  this scale.
+- **No resizing the Oracle instance above 1 OCPU / 6GB** without explicit
+  cost discussion — this server was previously accidentally provisioned at
+  4x this size, which would have exceeded the free monthly allowance if
+  left running.
 
-- No queueing/rate-limiting infrastructure (see cost model above)
-- No multi-server (multi-guild-at-scale) support — SQLite and the current
-  design assume one Discord server
-- No CI/CD pipeline — deployment is manual/SSH-based by design, given the
-  small scale
-- No multi-campaign support yet (designed but not built — if implementing,
-  the agreed design is *explicit* `campaign` parameters on setup/lookup
-  commands like `/character link` and `/notes search`, NOT binding
-  campaigns to specific channels; `/session start` takes the campaign
-  explicitly, but `/session pause|resume|end|force-leave` resolve the
-  active session by which voice channel the caller is currently in, so
-  two campaigns can record concurrently without extra parameters on those)
-- No AI-generated recap image yet (designed but not built — agreed plan:
-  one image per recap, always on, via a second Claude call to turn the
-  "Memorable Moments" section into an image-generation prompt, sent to an
-  external image API — OpenAI's was the leading candidate — with the
-  result attached to the recap post the same way the transcript file is)
+## DEFERRED FEATURES (designed, not yet built — do not build unprompted)
+
+- **Multi-campaign support.** Agreed design: explicit `campaign` parameter
+  on setup/lookup commands (`/character link`, `/character set-dm`,
+  `/notes recent`, `/notes search`). `/session start` takes `campaign`
+  explicitly. `/session pause|resume|end|force-leave` do NOT take a
+  campaign parameter — they resolve the active session via which voice
+  channel the caller is currently in, so two campaigns can record
+  concurrently. Rejected alternative: binding campaigns to fixed channels
+  (explicitly ruled out by the project owner).
+- **AI-generated recap image.** Agreed design: one image per recap, always
+  on. A second Claude call turns the recap's "Memorable Moments" section
+  into an image-generation prompt; sent to an external image API (OpenAI's
+  was the leading candidate, not yet integrated); result attached to the
+  recap post the same way the transcript file is.
+
+## AI COMPLETION CHECKLIST
+
+Before presenting any proposed code change, explicitly confirm:
+- [ ] Does not introduce a blocking call inside `async` code (Rule 1)
+- [ ] Does not bypass or weaken the auto-reconnect watchdog (Rule 2)
+- [ ] Any recording start/stop goes through `_stop_recording_and_wait()`
+      (Rule 3)
+- [ ] No new timeout shorter than 90 minutes around transcription (Rule 4)
+- [ ] Any new audio-writing code cleans up its files (Rule 5)
+- [ ] Any schema change uses the guarded `ALTER TABLE` pattern (Rule 6)
+- [ ] `python3 -m py_compile` run on every changed file
+- [ ] Uses Slash Commands only, not prefix commands
+- [ ] Does not add anything listed under ANTI-PATTERNS
+- [ ] Deployment instructions followed, including the final GitHub push
